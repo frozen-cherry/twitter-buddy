@@ -1,15 +1,9 @@
-const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
+require("./env");
 const config = require("./config");
 const { launchBrowser, collectTweets, saveTweets, log } = require("./collect-timeline");
-
-const dotenvResult = require("dotenv").config({ path: path.join(__dirname, ".env") });
-if (dotenvResult.parsed) {
-  for (const [k, v] of Object.entries(dotenvResult.parsed)) {
-    if (!process.env[k]) process.env[k] = v;
-  }
-}
+const { generateText, resolveScopeSettings } = require("./llm");
 
 /**
  * 导航到 "为你推荐" (For You) 标签页
@@ -87,7 +81,7 @@ function buildTweetSummary(tweets) {
 /**
  * 调用 LLM 分析推文，发现值得关注的账号
  */
-async function analyzeForDiscover(tweets) {
+async function analyzeForDiscover(tweets, options = {}) {
   if (tweets.length === 0) {
     log("[discover] No tweets to analyze.");
     return null;
@@ -96,22 +90,22 @@ async function analyzeForDiscover(tweets) {
   log(`[discover] Analyzing ${tweets.length} tweets for account discovery ...`);
 
   const tweetSummary = buildTweetSummary(tweets);
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
   const discoverPrompt = config.discover.prompt;
+  const llm = resolveScopeSettings("discover", options);
+  const prompt = `${discoverPrompt}\n\n---\n\n以下是从"为你推荐"采集到的 ${tweets.length} 条推文：\n\n${tweetSummary}`;
 
-  const message = await client.messages.create({
-    model: config.discover.model || config.analysis.model,
-    max_tokens: config.discover.maxTokens || config.analysis.maxTokens,
-    messages: [
-      {
-        role: "user",
-        content: `${discoverPrompt}\n\n---\n\n以下是从"为你推荐"采集到的 ${tweets.length} 条推文：\n\n${tweetSummary}`,
-      },
-    ],
+  log(`[discover] Calling ${llm.providerConfig.label} (${llm.provider}/${llm.model}) ...`);
+
+  const analysisText = await generateText({
+    provider: llm.provider,
+    model: llm.model,
+    maxTokens: llm.maxTokens,
+    prompt,
   });
 
-  const analysisText = message.content[0].text;
+  if (!analysisText) {
+    throw new Error(`LLM returned empty content (${llm.provider}/${llm.model})`);
+  }
 
   // 保存结果
   fs.mkdirSync(config.discoverDir, { recursive: true });
@@ -125,13 +119,20 @@ async function analyzeForDiscover(tweets) {
     const d = new Date(new Date(iso).getTime() + 8 * 60 * 60 * 1000);
     return d.toISOString().slice(0, 19).replace("T", " ");
   };
-  const header = `# 账号发现报告\n\n- 时间：${fmtTime(new Date().toISOString())} (UTC+8)\n- 推文数量：${tweets.length}\n- 来源：为你推荐 (For You)\n- 时间范围：${fmtTime(tweets[tweets.length - 1]?.time)} ~ ${fmtTime(tweets[0]?.time)}\n\n---\n\n`;
+  const header = `# 账号发现报告\n\n- 时间：${fmtTime(new Date().toISOString())} (UTC+8)\n- Provider：${llm.provider}\n- Model：${llm.model}\n- 推文数量：${tweets.length}\n- 来源：为你推荐 (For You)\n- 时间范围：${fmtTime(tweets[tweets.length - 1]?.time)} ~ ${fmtTime(tweets[0]?.time)}\n\n---\n\n`;
   fs.writeFileSync(filepath, header + analysisText, "utf-8");
 
   log(`[discover] Report saved to ${filepath}`);
   console.log("\n" + analysisText + "\n");
 
-  return { filepath, filename, analysis: analysisText, tweetCount: tweets.length };
+  return {
+    filepath,
+    filename,
+    analysis: analysisText,
+    tweetCount: tweets.length,
+    provider: llm.provider,
+    model: llm.model,
+  };
 }
 
 /**
@@ -158,7 +159,10 @@ async function runDiscover(options = {}) {
     saveTweets(result.tweets, config.discoverDir);
 
     // LLM 分析
-    const analysisResult = await analyzeForDiscover(result.tweets);
+    const analysisResult = await analyzeForDiscover(result.tweets, {
+      provider: options.provider,
+      model: options.model,
+    });
 
     log("=== Account discovery complete ===");
     return analysisResult;

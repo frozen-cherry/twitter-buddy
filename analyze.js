@@ -1,15 +1,8 @@
-const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
+require("./env");
 const config = require("./config");
-
-const dotenvResult = require("dotenv").config({ path: path.join(__dirname, ".env") });
-if (dotenvResult.parsed) {
-  // Manually assign in case dotenv fails to set process.env (Windows edge case)
-  for (const [k, v] of Object.entries(dotenvResult.parsed)) {
-    if (!process.env[k]) process.env[k] = v;
-  }
-}
+const { generateText, resolveScopeSettings } = require("./llm");
 
 function log(msg) {
   const ts = new Date().toLocaleTimeString();
@@ -79,9 +72,11 @@ function buildTweetSummary(tweets) {
 /**
  * 运行 LLM 分析
  */
-async function runAnalysis(hoursAgo, model) {
+async function runAnalysis(hoursAgo, options = {}) {
+  if (typeof options === "string") options = { model: options };
+
   hoursAgo = hoursAgo || config.analysis.analysisHours;
-  const useModel = model || config.analysis.model;
+  const llm = resolveScopeSettings("analysis", options);
 
   log(`Loading tweets from last ${hoursAgo} hours ...`);
   const tweets = loadTweetsSince(hoursAgo);
@@ -94,23 +89,20 @@ async function runAnalysis(hoursAgo, model) {
   log(`Found ${tweets.length} tweets for analysis.`);
 
   const tweetSummary = buildTweetSummary(tweets);
+  const prompt = `${config.analysis.prompt}\n\n---\n\n以下是最近 ${hoursAgo} 小时的 ${tweets.length} 条推文：\n\n${tweetSummary}`;
 
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  log(`Calling ${llm.providerConfig.label} (${llm.provider}/${llm.model}) ...`);
 
-  log(`Calling Claude API (${useModel}) ...`);
-
-  const message = await client.messages.create({
-    model: useModel,
-    max_tokens: config.analysis.maxTokens,
-    messages: [
-      {
-        role: "user",
-        content: `${config.analysis.prompt}\n\n---\n\n以下是最近 ${hoursAgo} 小时的 ${tweets.length} 条推文：\n\n${tweetSummary}`,
-      },
-    ],
+  const analysisText = await generateText({
+    provider: llm.provider,
+    model: llm.model,
+    maxTokens: llm.maxTokens,
+    prompt,
   });
 
-  const analysisText = message.content[0].text;
+  if (!analysisText) {
+    throw new Error(`LLM returned empty content (${llm.provider}/${llm.model})`);
+  }
 
   // 保存分析结果
   fs.mkdirSync(config.analysisDir, { recursive: true });
@@ -124,13 +116,19 @@ async function runAnalysis(hoursAgo, model) {
     const d = new Date(new Date(iso).getTime() + 8 * 60 * 60 * 1000);
     return d.toISOString().slice(0, 19).replace("T", " ");
   };
-  const header = `# 时间线分析报告\n\n- 时间：${fmtTime(new Date().toISOString())} (UTC+8)\n- 推文数量：${tweets.length}\n- 时间范围：${fmtTime(tweets[tweets.length - 1]?.time)} ~ ${fmtTime(tweets[0]?.time)}\n\n---\n\n`;
+  const header = `# 时间线分析报告\n\n- 时间：${fmtTime(new Date().toISOString())} (UTC+8)\n- Provider：${llm.provider}\n- Model：${llm.model}\n- 推文数量：${tweets.length}\n- 时间范围：${fmtTime(tweets[tweets.length - 1]?.time)} ~ ${fmtTime(tweets[0]?.time)}\n\n---\n\n`;
   fs.writeFileSync(filepath, header + analysisText, "utf-8");
 
   log(`Analysis saved to ${filepath}`);
   console.log("\n" + analysisText + "\n");
 
-  return { filepath, analysis: analysisText, tweetCount: tweets.length };
+  return {
+    filepath,
+    analysis: analysisText,
+    tweetCount: tweets.length,
+    provider: llm.provider,
+    model: llm.model,
+  };
 }
 
 // 导出

@@ -2,6 +2,7 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
+const { getPublicLLMConfig } = require("./llm");
 
 const PORT = config.dashboard?.port || 3456;
 
@@ -155,9 +156,237 @@ function getTweetStats() {
   };
 }
 
+function readJsonBody(req) {
+  return new Promise((resolve, reject) => {
+    let body = "";
+    req.on("data", (chunk) => body += chunk);
+    req.on("end", () => {
+      try {
+        resolve(body ? JSON.parse(body) : {});
+      } catch (err) {
+        reject(err);
+      }
+    });
+    req.on("error", reject);
+  });
+}
+
+const SETTINGS_DEFAULT_FIELDS = [
+  { key: "LLM_DEFAULT_PROVIDER", label: "Default Provider", type: "select-provider", scope: "default" },
+  { key: "ANALYSIS_PROVIDER", label: "Analysis Provider", type: "select-provider", scope: "analysis" },
+  { key: "ANALYSIS_MODEL", label: "Analysis Model", type: "select-model", scope: "analysis" },
+  { key: "DISCOVER_PROVIDER", label: "Discovery Provider", type: "select-provider", scope: "discover" },
+  { key: "DISCOVER_MODEL", label: "Discovery Model", type: "select-model", scope: "discover" },
+];
+
+function getProviderOrThrow(providerId) {
+  const provider = config.llm.providers[providerId];
+  if (!provider) {
+    throw new Error(`Unknown provider: ${providerId}`);
+  }
+  return provider;
+}
+
+function buildUrl(baseURL, pathname) {
+  const normalizedBase = baseURL.endsWith("/") ? baseURL : `${baseURL}/`;
+  return new URL(pathname.replace(/^\//, ""), normalizedBase).toString();
+}
+
+function getProviderApiKey(provider) {
+  const apiKey = provider.apiKeyEnv ? process.env[provider.apiKeyEnv] || "" : "";
+  if (!apiKey && !provider.apiKeyOptional) {
+    throw new Error(`Missing ${provider.apiKeyEnv}`);
+  }
+  return apiKey;
+}
+
+function getProviderBaseURL(providerId, provider) {
+  const envBaseURL = provider.baseUrlEnv ? process.env[provider.baseUrlEnv] || "" : "";
+  if (envBaseURL) return envBaseURL;
+  if (provider.baseUrlDefault) return provider.baseUrlDefault;
+  if (providerId === "openai") return "https://api.openai.com/v1";
+  if (providerId === "anthropic") return "https://api.anthropic.com";
+  return "";
+}
+
+async function fetchJson(url, options = {}) {
+  const response = await fetch(url, options);
+  const text = await response.text();
+  let data = {};
+  try {
+    data = text ? JSON.parse(text) : {};
+  } catch {
+    data = { raw: text };
+  }
+
+  if (!response.ok) {
+    const message = data?.error?.message || data?.message || data?.raw || `${response.status} ${response.statusText}`;
+    throw new Error(message);
+  }
+
+  return data;
+}
+
+async function fetchOpenAIStyleModels(providerId, provider) {
+  const baseURL = getProviderBaseURL(providerId, provider);
+  if (!baseURL) throw new Error("Missing base URL");
+  const apiKey = getProviderApiKey(provider);
+  const headers = { Accept: "application/json" };
+  if (apiKey) headers.Authorization = `Bearer ${apiKey}`;
+
+  const data = await fetchJson(buildUrl(baseURL, "models"), { headers });
+  return (data.data || [])
+    .map((item) => item?.id)
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+async function fetchAnthropicStyleModels(providerId, provider) {
+  const baseURL = getProviderBaseURL(providerId, provider);
+  if (!baseURL) throw new Error("Missing base URL");
+  const apiKey = getProviderApiKey(provider);
+  const headers = {
+    Accept: "application/json",
+    "anthropic-version": "2023-06-01",
+  };
+  if (apiKey) headers["x-api-key"] = apiKey;
+
+  const data = await fetchJson(buildUrl(baseURL, "v1/models"), { headers });
+  return (data.data || [])
+    .map((item) => item?.id)
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+async function fetchGeminiModels() {
+  const apiKey = process.env.GOOGLE_API_KEY || "";
+  if (!apiKey) throw new Error("Missing GOOGLE_API_KEY");
+  const url = new URL("https://generativelanguage.googleapis.com/v1beta/models");
+  url.searchParams.set("key", apiKey);
+  const data = await fetchJson(url.toString());
+  return (data.models || [])
+    .filter((model) => {
+      if (!Array.isArray(model.supportedGenerationMethods)) return true;
+      return model.supportedGenerationMethods.includes("generateContent");
+    })
+    .map((model) => (model.name || "").replace(/^models\//, ""))
+    .filter(Boolean)
+    .sort((a, b) => a.localeCompare(b));
+}
+
+async function fetchProviderModels(providerId) {
+  const provider = getProviderOrThrow(providerId);
+  if (provider.apiStyle === "gemini") {
+    return fetchGeminiModels();
+  }
+  if (provider.apiStyle === "anthropic") {
+    return fetchAnthropicStyleModels(providerId, provider);
+  }
+  if (provider.apiStyle === "openai") {
+    return fetchOpenAIStyleModels(providerId, provider);
+  }
+  throw new Error(`Model refresh unsupported for ${providerId}`);
+}
+
+async function testProviderConnection(providerId) {
+  const models = await fetchProviderModels(providerId);
+  return {
+    ok: true,
+    modelCount: models.length,
+    firstModel: models[0] || "",
+  };
+}
+
+function getSettingsSchema() {
+  const providerSections = Object.entries(config.llm.providers).map(([id, provider]) => {
+    const fields = [];
+    if (provider.apiKeyEnv) {
+      fields.push({ key: provider.apiKeyEnv, label: `${provider.label} API Key`, type: "password" });
+    }
+    if (provider.baseUrlEnv) {
+      fields.push({ key: provider.baseUrlEnv, label: `${provider.label} Base URL`, type: "text" });
+    }
+    if (provider.modelsEnv) {
+      fields.push({ key: provider.modelsEnv, label: `${provider.label} Models`, type: "textarea" });
+    }
+    return { id, title: provider.label, fields, actions: ["test", "refresh-models"] };
+  }).filter((section) => section.fields.length > 0);
+
+  return {
+    sections: [
+      { id: "defaults", title: "Defaults", fields: SETTINGS_DEFAULT_FIELDS },
+      ...providerSections,
+    ],
+  };
+}
+
+function getSettingsPayload() {
+  const schema = getSettingsSchema();
+  const values = {};
+  for (const section of schema.sections) {
+    for (const field of section.fields) {
+      values[field.key] = process.env[field.key] || "";
+    }
+  }
+  return {
+    ...schema,
+    values,
+    llmConfig: getPublicLLMConfig(),
+  };
+}
+
+function saveEnvValues(values) {
+  const schema = getSettingsSchema();
+  const allowedKeys = new Set(schema.sections.flatMap((section) => section.fields.map((field) => field.key)));
+  const envPath = path.join(__dirname, ".env");
+
+  let lines = [];
+  if (fs.existsSync(envPath)) {
+    lines = fs.readFileSync(envPath, "utf-8").split(/\r?\n/);
+  }
+
+  const lineIndex = new Map();
+  lines.forEach((line, index) => {
+    const match = line.match(/^\s*([A-Z0-9_]+)\s*=/);
+    if (match) lineIndex.set(match[1], index);
+  });
+
+  for (const [key, rawValue] of Object.entries(values || {})) {
+    if (!allowedKeys.has(key)) continue;
+    const value = String(rawValue || "");
+    const nextLine = `${key}=${value}`;
+    if (lineIndex.has(key)) {
+      lines[lineIndex.get(key)] = nextLine;
+    } else {
+      lines.push(nextLine);
+    }
+    process.env[key] = value;
+  }
+
+  const text = lines.join("\n").replace(/\n*$/, "\n");
+  fs.writeFileSync(envPath, text, "utf-8");
+  config.refreshFromEnv();
+}
+
+async function refreshProviderModelsAndSave(providerId) {
+  const provider = getProviderOrThrow(providerId);
+  if (!provider.modelsEnv) {
+    throw new Error(`Provider ${providerId} does not support persisted model lists`);
+  }
+  const modelIds = await fetchProviderModels(providerId);
+  if (!modelIds.length) {
+    throw new Error(`No models returned for ${providerId}`);
+  }
+  saveEnvValues({ [provider.modelsEnv]: modelIds.join(",") });
+  return modelIds;
+}
+
 // ========== HTML Dashboard ==========
 
-const DASHBOARD_HTML = `<!DOCTYPE html>
+function renderDashboardHtml() {
+  const initialLLMConfig = JSON.stringify(getPublicLLMConfig()).replace(/</g, "\\u003c");
+
+  return `<!DOCTYPE html>
 <html lang="zh-CN">
 <head>
 <meta charset="UTF-8">
@@ -186,8 +415,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .view-tab:hover { color: #e7e9ea; }
   .view-tab.active { color: #1d9bf0; border-bottom-color: #1d9bf0; }
 
-  .analyze-bar { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
-  .analyze-bar .label { color: #71767b; font-size: 13px; }
+  .page-controls { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+  .top-right-controls { display: flex; align-items: center; gap: 8px; padding: 8px 0; }
+  .label { color: #71767b; font-size: 13px; }
   .analyze-btn { background: #16202a; border: 1px solid #2f3336; color: #e7e9ea; padding: 5px 12px; border-radius: 16px; cursor: pointer; font-size: 13px; transition: all 0.15s; }
   .analyze-btn:hover { border-color: #1d9bf0; color: #1d9bf0; }
   .analyze-btn.running { border-color: #f4900c; color: #f4900c; cursor: wait; }
@@ -239,6 +469,24 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   .toast.show { display: block; }
   .toast.error { border-color: #f4212e; }
   .toast.success { border-color: #00ba7c; }
+
+  .settings-wrap { max-width: 1100px; padding: 24px 36px; }
+  .settings-header { display: flex; align-items: center; gap: 12px; margin-bottom: 20px; }
+  .settings-header h2 { font-size: 20px; margin: 0; }
+  .settings-header p { color: #71767b; font-size: 13px; margin: 0; }
+  .settings-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(320px, 1fr)); gap: 16px; }
+  .settings-card { background: #16202a; border: 1px solid #2f3336; border-radius: 14px; padding: 16px; }
+  .settings-card-header { display: flex; align-items: center; gap: 10px; margin-bottom: 12px; }
+  .settings-card h3 { font-size: 15px; margin: 0; flex: 1; }
+  .settings-field { display: flex; flex-direction: column; gap: 6px; margin-bottom: 12px; }
+  .settings-field label { color: #71767b; font-size: 12px; }
+  .settings-field input, .settings-field textarea, .settings-field select { background: #0f1419; border: 1px solid #2f3336; color: #e7e9ea; padding: 9px 10px; border-radius: 8px; font-size: 13px; width: 100%; }
+  .settings-field textarea { min-height: 72px; resize: vertical; }
+  .settings-actions { display: flex; gap: 10px; align-items: center; margin-bottom: 16px; }
+  .card-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+  .mini-btn { background: #0f1419; border: 1px solid #2f3336; color: #e7e9ea; padding: 5px 10px; border-radius: 999px; cursor: pointer; font-size: 12px; }
+  .mini-btn:hover { border-color: #1d9bf0; color: #1d9bf0; }
+  .settings-note { color: #71767b; font-size: 12px; margin-top: -4px; margin-bottom: 12px; }
 </style>
 </head>
 <body>
@@ -253,24 +501,16 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <div class="toolbar">
     <div class="view-tabs">
       <div class="view-tab active" onclick="switchView('analyses')">Analysis Reports</div>
-      <div class="view-tab" onclick="switchView('discovers')">Discover</div>
+      <div class="view-tab" onclick="switchView('discovers')">Discovery Reports</div>
+      <div class="view-tab" onclick="switchView('settings')">Settings</div>
       <div class="view-tab" onclick="switchView('stats')">Stats</div>
       <div class="view-tab" onclick="switchView('tweets')">Tweet Data Files</div>
     </div>
-    <div class="analyze-bar">
-      <span class="label">Analyze:</span>
-      <button class="analyze-btn" onclick="runAnalyze(1)">1h</button>
-      <button class="analyze-btn" onclick="runAnalyze(2)">2h</button>
-      <button class="analyze-btn" onclick="runAnalyze(8)">8h</button>
-      <input class="custom-hours" id="custom-hours" type="number" min="1" max="720" placeholder="h" title="Custom hours">
-      <button class="analyze-btn" onclick="runAnalyze(null)">Go</button>
-      <span class="label" style="margin-left:12px">Model:</span>
-      <select class="model-select" id="model-select">
-        <option value="claude-opus-4-6">Opus 4.6</option>
-        <option value="claude-sonnet-4-6">Sonnet 4.6</option>
-        <option value="claude-sonnet-4-20250514">Sonnet 4</option>
-        <option value="claude-haiku-4-5-20251001">Haiku 4.5</option>
-      </select>
+    <div class="top-right-controls">
+      <span class="label">Provider:</span>
+      <select class="model-select" id="global-provider-select" onchange="handleGlobalProviderChange()"></select>
+      <span class="label">Model:</span>
+      <select class="model-select" id="global-model-select" onchange="handleGlobalModelChange()"></select>
     </div>
   </div>
 
@@ -292,6 +532,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 <script>
   let currentView = 'analyses';
   let isExpanded = false;
+  let llmConfig = ${initialLLMConfig};
 
   function showToast(msg, type) {
     const t = document.getElementById('toast');
@@ -307,18 +548,260 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     document.getElementById('expand-btn').textContent = isExpanded ? 'Collapse' : 'Expand';
   }
 
-  const viewOrder = ['analyses', 'discovers', 'stats', 'tweets'];
+  function providerLabel(provider) {
+    if (!provider) return '';
+    if (provider.configured && provider.baseUrlConfigured) return provider.label;
+    return provider.label + ' (未配置)';
+  }
+
+  function getProviderById(id) {
+    return llmConfig.providers.find((provider) => provider.id === id) || null;
+  }
+
+  function getSelectedProvider(scope) {
+    const select = document.getElementById(scope + '-provider-select');
+    const providerId = select ? select.value : llmConfig[scope]?.provider;
+    return getProviderById(providerId) || llmConfig.providers[0] || null;
+  }
+
+  function getGlobalScope() {
+    if (currentView === 'discovers') return 'discover';
+    return 'analysis';
+  }
+
+  function buildProviderOptions(scope) {
+    const selectedProvider = llmConfig[scope]?.provider;
+    return llmConfig.providers.map((provider) => {
+      const selected = provider.id === selectedProvider ? ' selected' : '';
+      return '<option value="' + provider.id + '"' + selected + '>' + providerLabel(provider) + '</option>';
+    }).join('');
+  }
+
+  function buildModelOptions(scope, providerId, selectedModel) {
+    const provider = getProviderById(providerId);
+    if (!provider) return '';
+    return provider.models.map((model) => {
+      const selected = model.id === selectedModel ? ' selected' : '';
+      return '<option value="' + model.id + '"' + selected + '>' + model.label + '</option>';
+    }).join('');
+  }
+
+  function syncModelSelect(scope, preferredModel) {
+    const provider = getSelectedProvider(scope);
+    const modelSelect = document.getElementById(scope + '-model-select');
+    if (!provider || !modelSelect) return;
+
+    const providerModels = provider.models || [];
+    const currentModel = preferredModel || llmConfig[scope]?.model;
+    const fallbackModel = providerModels.find((model) => model.id === currentModel)?.id || providerModels[0]?.id || '';
+
+    modelSelect.innerHTML = buildModelOptions(scope, provider.id, fallbackModel);
+    modelSelect.value = fallbackModel;
+    llmConfig[scope] = { provider: provider.id, model: fallbackModel };
+  }
+
+  function syncGlobalProviderControls() {
+    const scope = getGlobalScope();
+    const providerSelect = document.getElementById('global-provider-select');
+    const modelSelect = document.getElementById('global-model-select');
+    if (!providerSelect || !modelSelect) return;
+
+    providerSelect.innerHTML = buildProviderOptions(scope);
+    providerSelect.value = llmConfig[scope].provider;
+
+    const provider = getProviderById(llmConfig[scope].provider) || llmConfig.providers[0];
+    const models = provider ? provider.models : [];
+    const selectedModel = models.find((model) => model.id === llmConfig[scope].model)?.id || models[0]?.id || '';
+    modelSelect.innerHTML = buildModelOptions(scope, provider?.id, selectedModel);
+    modelSelect.value = selectedModel;
+    llmConfig[scope].model = selectedModel;
+  }
+
+  function handleGlobalProviderChange() {
+    const scope = getGlobalScope();
+    const providerSelect = document.getElementById('global-provider-select');
+    if (!providerSelect) return;
+    llmConfig[scope].provider = providerSelect.value;
+    llmConfig[scope].model = getProviderById(providerSelect.value)?.models?.[0]?.id || '';
+    syncGlobalProviderControls();
+    if (scope === 'analysis') loadAnalyses();
+    else loadDiscovers();
+  }
+
+  function handleGlobalModelChange() {
+    const scope = getGlobalScope();
+    const modelSelect = document.getElementById('global-model-select');
+    if (!modelSelect) return;
+    llmConfig[scope].model = modelSelect.value;
+  }
+
+  function handleProviderChange(scope) {
+    const select = document.getElementById(scope + '-provider-select');
+    if (!select) return;
+    llmConfig[scope].provider = select.value;
+    syncModelSelect(scope, null);
+  }
+
+  function updateToolbarVisibility() {
+    const controls = document.querySelector('.top-right-controls');
+    if (!controls) return;
+    controls.style.display = currentView === 'stats' || currentView === 'tweets' || currentView === 'settings' ? 'none' : 'flex';
+    syncGlobalProviderControls();
+  }
+
+  async function loadLlmConfig() {
+    const res = await fetch('/api/llm-config');
+    llmConfig = await res.json();
+    syncGlobalProviderControls();
+  }
+
+  function escapeHtml(value) {
+    return String(value || '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function renderSettingsField(field, value) {
+    const safeValue = escapeHtml(value);
+    const inputId = 'setting-' + field.key;
+    if (field.type === 'select-provider') {
+      const selectedProvider = value || (field.scope === 'default' ? llmConfig.defaultProvider : llmConfig[field.scope].provider);
+      const options = llmConfig.providers.map((provider) => {
+        const selected = provider.id === selectedProvider ? ' selected' : '';
+        return '<option value="' + provider.id + '"' + selected + '>' + escapeHtml(provider.label) + '</option>';
+      }).join('');
+      const extra = field.scope === 'analysis' || field.scope === 'discover'
+        ? ' onchange="handleSettingsProviderChange(&quot;' + field.scope + '&quot;)"'
+        : '';
+      return '<div class="settings-field"><label for="' + inputId + '">' + field.label + '</label><select id="' + inputId + '" data-key="' + field.key + '" data-scope="' + (field.scope || '') + '"' + extra + '>' + options + '</select></div>';
+    }
+    if (field.type === 'select-model') {
+      const scope = field.scope;
+      const providerId = (document.getElementById('setting-' + scope.toUpperCase() + '_PROVIDER')?.value) || llmConfig[scope].provider;
+      const provider = getProviderById(providerId) || llmConfig.providers[0];
+      const currentModel = value || llmConfig[scope].model;
+      const options = (provider?.models || []).map((model) => {
+        const selected = model.id === currentModel ? ' selected' : '';
+        return '<option value="' + model.id + '"' + selected + '>' + escapeHtml(model.label) + '</option>';
+      }).join('');
+      return '<div class="settings-field"><label for="' + inputId + '">' + field.label + '</label><select id="' + inputId + '" data-key="' + field.key + '" data-scope="' + scope + '">' + options + '</select></div>';
+    }
+    if (field.type === 'textarea') {
+      return '<div class="settings-field"><label for="' + inputId + '">' + field.label + '</label><textarea id="' + inputId + '" data-key="' + field.key + '">' + safeValue + '</textarea></div>';
+    }
+    return '<div class="settings-field"><label for="' + inputId + '">' + field.label + '</label><input id="' + inputId + '" data-key="' + field.key + '" type="' + (field.type || 'text') + '" value="' + safeValue + '"></div>';
+  }
+
+  function handleSettingsProviderChange(scope) {
+    const providerSelect = document.getElementById('setting-' + scope.toUpperCase() + '_PROVIDER');
+    const modelSelect = document.getElementById('setting-' + scope.toUpperCase() + '_MODEL');
+    const provider = getProviderById(providerSelect?.value);
+    if (!provider || !modelSelect) return;
+    modelSelect.innerHTML = (provider.models || []).map((model, index) => {
+      const selected = index === 0 ? ' selected' : '';
+      return '<option value="' + model.id + '"' + selected + '>' + escapeHtml(model.label) + '</option>';
+    }).join('');
+  }
+
+  function renderSettingsSection(section, data) {
+    const actions = section.id === 'defaults'
+      ? ''
+      : '<div class="card-actions">' +
+        '<button class="mini-btn" onclick="testProvider(&quot;' + section.id + '&quot;)">Test</button>' +
+        '<button class="mini-btn" onclick="refreshProviderModels(&quot;' + section.id + '&quot;)">Refresh Models</button>' +
+        '</div>';
+
+    return '<div class="settings-card">' +
+      '<div class="settings-card-header"><h3>' + section.title + '</h3>' + actions + '</div>' +
+      section.fields.map((field) => renderSettingsField(field, data.values[field.key] || '')).join('') +
+      '</div>';
+  }
+
+  async function loadSettings() {
+    const res = await fetch('/api/settings');
+    const data = await res.json();
+    llmConfig = data.llmConfig;
+    const sectionsHtml = data.sections.map((section) => renderSettingsSection(section, data)).join('');
+
+    document.getElementById('content-area').innerHTML =
+      '<div class="settings-wrap">' +
+      '<div class="settings-header"><div><h2>Settings</h2><p>修改后会写回 .env，并立即刷新当前 Dashboard 配置。</p></div></div>' +
+      '<div class="settings-actions"><button class="btn" onclick="saveSettings()">Save Settings</button><div class="settings-note">官方模型列表刷新：OpenAI / Anthropic / Gemini 走官方接口，兼容型 provider 优先尝试标准 /models。</div></div>' +
+      '<div class="settings-grid">' + sectionsHtml + '</div>' +
+      '</div>';
+  }
+
+  async function saveSettings() {
+    const values = {};
+    document.querySelectorAll('[data-key]').forEach((el) => {
+      values[el.dataset.key] = el.value;
+    });
+    try {
+      const res = await fetch('/api/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ values })
+      });
+      const data = await res.json();
+      if (data.error) {
+        showToast('Save failed: ' + data.error, 'error');
+        return;
+      }
+      llmConfig = data.llmConfig;
+      updateToolbarVisibility();
+      await loadSettings();
+      showToast('Settings saved to .env', 'success');
+    } catch (err) {
+      showToast('Save failed: ' + err.message, 'error');
+    }
+  }
+
+  async function testProvider(providerId) {
+    try {
+      const res = await fetch('/api/settings/provider/' + encodeURIComponent(providerId) + '/test', { method: 'POST' });
+      const data = await res.json();
+      if (data.error) {
+        showToast('Test failed: ' + data.error, 'error');
+        return;
+      }
+      showToast('Connection OK: ' + data.modelCount + ' models' + (data.firstModel ? ' | ' + data.firstModel : ''), 'success');
+    } catch (err) {
+      showToast('Test failed: ' + err.message, 'error');
+    }
+  }
+
+  async function refreshProviderModels(providerId) {
+    try {
+      const res = await fetch('/api/settings/provider/' + encodeURIComponent(providerId) + '/refresh-models', { method: 'POST' });
+      const data = await res.json();
+      if (data.error) {
+        showToast('Refresh failed: ' + data.error, 'error');
+        return;
+      }
+      llmConfig = data.llmConfig;
+      await loadSettings();
+      showToast('Models updated: ' + data.updatedCount, 'success');
+    } catch (err) {
+      showToast('Refresh failed: ' + err.message, 'error');
+    }
+  }
+
+  const viewOrder = ['analyses', 'discovers', 'settings', 'stats', 'tweets'];
   function switchView(view) {
     currentView = view;
+    updateToolbarVisibility();
     document.querySelectorAll('.view-tab').forEach((tab, i) => {
       tab.classList.toggle('active', viewOrder[i] === view);
     });
-    const isStats = view === 'stats';
-    document.getElementById('file-list').style.display = isStats ? 'none' : '';
-    document.getElementById('main-layout').style.gridTemplateColumns = isStats ? '1fr' : '280px 1fr';
+    const singlePane = view === 'stats' || view === 'settings';
+    document.getElementById('file-list').style.display = singlePane ? 'none' : '';
+    document.getElementById('main-layout').style.gridTemplateColumns = singlePane ? '1fr' : '280px 1fr';
     document.getElementById('content-header').style.display = 'none';
     if (view === 'analyses') { loadAnalyses(); document.getElementById('content-area').innerHTML = '<div class="placeholder">Select an item to view</div>'; }
     else if (view === 'discovers') { loadDiscovers(); document.getElementById('content-area').innerHTML = '<div class="placeholder">Select an item to view</div>'; }
+    else if (view === 'settings') loadSettings();
     else if (view === 'stats') loadStats();
     else { loadTweetFiles(); document.getElementById('content-area').innerHTML = '<div class="placeholder">Select an item to view</div>'; }
   }
@@ -327,6 +810,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     await loadStatus();
     if (currentView === 'analyses') loadAnalyses();
     else if (currentView === 'discovers') loadDiscovers();
+    else if (currentView === 'settings') loadSettings();
     else if (currentView === 'stats') loadStats();
     else loadTweetFiles();
   }
@@ -371,18 +855,29 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     const files = await res.json();
     const list = document.getElementById('file-list');
     const nextAnalysis = _statusData ? calcNextRun(_statusData.state.lastAnalysisTime, _statusData.analysisIntervalMs) : '...';
-    const scheduleInfo = '<div style="font-size:11px;color:#71767b;font-weight:400;margin-top:4px">Next auto-analysis: <span style="color:#1d9bf0">' + nextAnalysis + '</span></div>';
+    const titleHtml = '<div class="panel-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
+      '<span style="flex:1">Analysis Reports (' + files.length + ')</span>' +
+      '<div style="font-size:11px;color:#71767b;font-weight:400;width:100%">Next auto-analysis: <span style="color:#1d9bf0">' + nextAnalysis + '</span></div>' +
+      '<div class="page-controls" style="width:100%">' +
+      '<span style="font-size:12px;color:#71767b">Run Analysis</span>' +
+      '<button class="analyze-btn" onclick="runAnalyze(1)">1h</button>' +
+      '<button class="analyze-btn" onclick="runAnalyze(2)">2h</button>' +
+      '<button class="analyze-btn" onclick="runAnalyze(8)">8h</button>' +
+      '<input class="custom-hours" id="custom-hours" type="number" min="1" max="720" placeholder="h" title="Custom hours">' +
+      '<button class="analyze-btn" onclick="runAnalyze(null)">Run</button>' +
+      '</div>' +
+      '</div>';
     if (files.length === 0) {
-      list.innerHTML = '<div class="panel-title">Analysis Reports' + scheduleInfo + '</div><div class="file-item"><div class="meta">No reports yet</div></div>';
-      return;
+      list.innerHTML = titleHtml + '<div class="file-item"><div class="meta">No reports yet</div></div>';
+    } else {
+      list.innerHTML = titleHtml +
+        files.map(f => \`
+          <div class="file-item" onclick="loadAnalysis('\${f.filename}', this)">
+            <div class="name">\${f.date}</div>
+            <div class="meta">\${f.filename} | \${(f.size / 1024).toFixed(1)} KB</div>
+          </div>
+        \`).join('');
     }
-    list.innerHTML = '<div class="panel-title">Analysis Reports (' + files.length + ')' + scheduleInfo + '</div>' +
-      files.map(f => \`
-        <div class="file-item" onclick="loadAnalysis('\${f.filename}', this)">
-          <div class="name">\${f.date}</div>
-          <div class="meta">\${f.filename} | \${(f.size / 1024).toFixed(1)} KB</div>
-        </div>
-      \`).join('');
   }
 
   async function loadAnalysis(filename, el) {
@@ -403,21 +898,24 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     const list = document.getElementById('file-list');
     const nextDiscover = _statusData ? calcNextRun(_statusData.state.lastDiscoverTime, _statusData.discoverIntervalMs) : '...';
     const titleHtml = '<div class="panel-title" style="display:flex;align-items:center;gap:10px;flex-wrap:wrap">' +
-      '<span style="flex:1">Discover (' + files.length + ')</span>' +
-      '<button class="analyze-btn" id="discover-run-btn" onclick="runDiscoverNow()" style="font-size:12px;padding:3px 10px">Run Now</button>' +
+      '<span style="flex:1">Discovery Reports (' + files.length + ')</span>' +
       '<div style="font-size:11px;color:#71767b;font-weight:400;width:100%">Next auto-discover: <span style="color:#1d9bf0">' + nextDiscover + '</span></div>' +
+      '<div class="page-controls" style="width:100%">' +
+      '<span style="font-size:12px;color:#71767b">Run Discovery</span>' +
+      '<button class="analyze-btn" id="discover-run-btn" onclick="runDiscoverNow()">Run Now</button>' +
+      '</div>' +
       '</div>';
     if (files.length === 0) {
       list.innerHTML = titleHtml + '<div class="file-item"><div class="meta">No reports yet</div></div>';
-      return;
+    } else {
+      list.innerHTML = titleHtml +
+        files.map(f => \`
+          <div class="file-item" onclick="loadDiscover('\${f.filename}', this)">
+            <div class="name">\${f.date}</div>
+            <div class="meta">\${f.filename} | \${(f.size / 1024).toFixed(1)} KB</div>
+          </div>
+        \`).join('');
     }
-    list.innerHTML = titleHtml +
-      files.map(f => \`
-        <div class="file-item" onclick="loadDiscover('\${f.filename}', this)">
-          <div class="name">\${f.date}</div>
-          <div class="meta">\${f.filename} | \${(f.size / 1024).toFixed(1)} KB</div>
-        </div>
-      \`).join('');
   }
 
   async function loadDiscover(filename, el) {
@@ -437,7 +935,15 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if (btn) { btn.classList.add('running'); btn.disabled = true; btn.textContent = 'Running...'; }
     showToast('Starting account discovery ...', '');
     try {
-      const res = await fetch('/api/discover', { method: 'POST' });
+      const payload = {
+        provider: llmConfig.discover.provider,
+        model: llmConfig.discover.model,
+      };
+      const res = await fetch('/api/discover', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload)
+      });
       const data = await res.json();
       if (data.error) {
         showToast('Discover failed: ' + data.error, 'error');
@@ -581,7 +1087,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       const res = await fetch('/api/analyze', {
         method: 'POST',
         headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ hours, model: document.getElementById('model-select').value })
+        body: JSON.stringify({
+          hours,
+          provider: llmConfig.analysis.provider,
+          model: llmConfig.analysis.model
+        })
       });
       const data = await res.json();
       if (data.error) {
@@ -606,10 +1116,17 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   });
 
   // Initial load
-  loadAll();
+  (async function initDashboard() {
+    updateToolbarVisibility();
+    try {
+      await loadLlmConfig();
+    } catch {}
+    await loadAll();
+  })();
 </script>
 </body>
 </html>`;
+}
 
 // ========== HTTP Server ==========
 
@@ -618,13 +1135,67 @@ const server = http.createServer((req, res) => {
 
   if (url.pathname === "/") {
     res.writeHead(200, { "Content-Type": "text/html; charset=utf-8" });
-    res.end(DASHBOARD_HTML);
+    res.end(renderDashboardHtml());
     return;
   }
 
   if (url.pathname === "/api/status") {
     res.writeHead(200, { "Content-Type": "application/json" });
     res.end(JSON.stringify(getStatus()));
+    return;
+  }
+
+  if (url.pathname === "/api/llm-config") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(getPublicLLMConfig()));
+    return;
+  }
+
+  if (url.pathname === "/api/settings" && req.method === "GET") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(getSettingsPayload()));
+    return;
+  }
+
+  if (url.pathname === "/api/settings" && req.method === "POST") {
+    (async () => {
+      try {
+        const body = await readJsonBody(req);
+        saveEnvValues(body.values || {});
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(getSettingsPayload()));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    })();
+    return;
+  }
+
+  const settingsProviderMatch = url.pathname.match(/^\/api\/settings\/provider\/([^/]+)\/(test|refresh-models)$/);
+  if (settingsProviderMatch && req.method === "POST") {
+    (async () => {
+      const providerId = decodeURIComponent(settingsProviderMatch[1]);
+      const action = settingsProviderMatch[2];
+      try {
+        if (action === "test") {
+          const result = await testProviderConnection(providerId);
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(result));
+          return;
+        }
+
+        const models = await refreshProviderModelsAndSave(providerId);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({
+          updatedCount: models.length,
+          llmConfig: getPublicLLMConfig(),
+        }));
+      } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    })();
     return;
   }
 
@@ -647,13 +1218,11 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === "/api/analyze" && req.method === "POST") {
-    let body = "";
-    req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
+    (async () => {
       try {
-        const { hours, model } = JSON.parse(body);
+        const { hours, provider, model } = await readJsonBody(req);
         const { runAnalysis } = require("./analyze");
-        const result = await runAnalysis(hours || 2, model);
+        const result = await runAnalysis(hours || 2, { provider, model });
         if (!result) {
           res.writeHead(200, { "Content-Type": "application/json" });
           res.end(JSON.stringify({ error: "No tweets found in this time range" }));
@@ -662,22 +1231,25 @@ const server = http.createServer((req, res) => {
           res.end(JSON.stringify({
             filename: path.basename(result.filepath),
             tweetCount: result.tweetCount,
+            provider: result.provider,
+            model: result.model,
           }));
         }
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
-    });
+    })();
     return;
   }
 
   if (url.pathname === "/api/discover" && req.method === "POST") {
-    res.writeHead(200, { "Content-Type": "application/json" });
     (async () => {
       try {
+        const { provider, model } = await readJsonBody(req);
         const { runDiscover } = require("./discover");
-        const result = await runDiscover();
+        const result = await runDiscover({ provider, model });
+        res.writeHead(200, { "Content-Type": "application/json" });
         if (!result) {
           res.end(JSON.stringify({ error: "No tweets collected from For You" }));
         } else {
@@ -687,9 +1259,15 @@ const server = http.createServer((req, res) => {
             stateData.lastDiscoverTime = new Date().toISOString();
             fs.writeFileSync(config.stateFile, JSON.stringify(stateData, null, 2), "utf-8");
           } catch {}
-          res.end(JSON.stringify({ filename: result.filename, tweetCount: result.tweetCount }));
+          res.end(JSON.stringify({
+            filename: result.filename,
+            tweetCount: result.tweetCount,
+            provider: result.provider,
+            model: result.model,
+          }));
         }
       } catch (err) {
+        res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
       }
     })();
