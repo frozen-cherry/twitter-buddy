@@ -1,6 +1,7 @@
 node_modules/
 .env
 .chrome-profile/
+.chrome-profile-binance/
 data/
 .claude/
 *.zip
