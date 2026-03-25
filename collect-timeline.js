@@ -1,11 +1,21 @@
-const { chromium } = require("playwright");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
 
+let _externalLog = null;
+
 function log(msg) {
   const ts = new Date().toLocaleTimeString();
   console.log(`[${ts}] ${msg}`);
+  if (_externalLog) _externalLog(msg);
+}
+
+function setLogger(fn) {
+  _externalLog = fn;
+}
+
+function clearLogger() {
+  _externalLog = null;
 }
 
 const rand = (min, max) => Math.floor(Math.random() * (max - min + 1)) + min;
@@ -75,34 +85,11 @@ const EXTRACT_ALL_FN = `
 })()`;
 
 /**
- * 启动浏览器（带反检测）
- */
-async function launchBrowser(chromeDataDir) {
-  const browser = await chromium.launchPersistentContext(
-    chromeDataDir || config.chromeDataDir,
-    {
-      channel: "chrome",
-      headless: false,
-      viewport: { width: 1280, height: 800 },
-      ignoreDefaultArgs: ["--enable-automation"],
-      args: [
-        "--disable-blink-features=AutomationControlled",
-        "--no-first-run",
-        "--no-default-browser-check",
-        "--window-position=-32000,-32000",
-      ],
-    }
-  );
-  await browser.addInitScript(() => {
-    Object.defineProperty(navigator, "webdriver", { get: () => undefined });
-  });
-  return browser;
-}
-
-/**
  * 导航到 Following 时间线（最近排序）
  */
 async function navigateToTimeline(page) {
+  // 清除上一次任务残留的扫描数据
+  await page.evaluate(() => { window._tweetMap = new Map(); }).catch(() => {});
   log("Navigating to x.com/home ...");
   await page.goto("https://x.com/home", { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(3000);
@@ -332,7 +319,7 @@ function saveTweets(tweets, outputDir) {
 }
 
 // 导出供 daemon.js 使用
-module.exports = { launchBrowser, navigateToTimeline, collectTweets, saveTweets, log };
+module.exports = { navigateToTimeline, collectTweets, saveTweets, log, setLogger, clearLogger };
 
 // CLI 模式：直接运行
 if (require.main === module) {
@@ -348,7 +335,8 @@ if (require.main === module) {
   }
 
   (async () => {
-    const browser = await launchBrowser();
+    const { getBrowser, closeBrowser } = require("./browser");
+    const browser = await getBrowser();
     const page = browser.pages()[0] || (await browser.newPage());
 
     if (loginMode) {
@@ -374,7 +362,7 @@ if (require.main === module) {
     } catch (err) {
       console.error("Error:", err);
     } finally {
-      await browser.close();
+      await closeBrowser();
     }
   })();
 }

@@ -2,7 +2,8 @@ const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
-const { launchBrowser, collectTweets, saveTweets, log } = require("./collect-timeline");
+const { collectTweets, saveTweets, log } = require("./collect-timeline");
+const { getBrowser, closeBrowser } = require("./browser");
 const { buildTweetSummary } = require("./analyze");
 
 const dotenvResult = require("dotenv").config({ path: path.join(__dirname, ".env") });
@@ -28,49 +29,44 @@ async function scrapeProfile(handle, options = {}) {
 
   profileLog(`Scraping @${handle} (max ${maxScrolls} scrolls) ...`);
 
-  const browser = await launchBrowser();
+  const browser = await getBrowser();
+  const page = browser.pages()[0] || await browser.newPage();
+
+  profileLog(`Navigating to https://x.com/${handle} ...`);
+  await page.goto(`https://x.com/${handle}`, { waitUntil: "domcontentloaded" });
+  await page.waitForTimeout(3000);
+
+  // 等待推文加载
   try {
-    const page = browser.pages()[0] || await browser.newPage();
-
-    profileLog(`Navigating to https://x.com/${handle} ...`);
-    await page.goto(`https://x.com/${handle}`, { waitUntil: "domcontentloaded" });
-    await page.waitForTimeout(3000);
-
-    // 等待推文加载
-    try {
-      await page.waitForSelector('[data-testid="tweet"]', { timeout: 10000 });
-    } catch {
-      profileLog("Warning: No tweets found on page, user may have no tweets or page didn't load");
-    }
-
-    // 清空 _tweetMap，避免残留数据
-    await page.evaluate(() => { window._tweetMap = new Map(); });
-
-    // 滚到顶部
-    await page.evaluate(() => window.scrollTo(0, 0));
-    await page.waitForTimeout(1000);
-
-    // 复用 collectTweets
-    const result = await collectTweets(page, { maxScrolls });
-
-    profileLog(`Collected ${result.tweets.length} tweets from @${handle}`);
-
-    if (result.tweets.length > 0) {
-      // saveTweets 支持自定义输出目录
-      saveTweets(result.tweets, profileDir);
-      profileLog(`Saved to ${profileDir}`);
-    }
-
-    return {
-      handle,
-      tweetCount: result.tweets.length,
-      newestTime: result.newestTime || null,
-      oldestTime: result.oldestTime || null,
-    };
-  } finally {
-    await browser.close();
-    profileLog("Browser closed");
+    await page.waitForSelector('[data-testid="tweet"]', { timeout: 10000 });
+  } catch {
+    profileLog("Warning: No tweets found on page, user may have no tweets or page didn't load");
   }
+
+  // 清空 _tweetMap，避免残留数据
+  await page.evaluate(() => { window._tweetMap = new Map(); });
+
+  // 滚到顶部
+  await page.evaluate(() => window.scrollTo(0, 0));
+  await page.waitForTimeout(1000);
+
+  // 复用 collectTweets
+  const result = await collectTweets(page, { maxScrolls });
+
+  profileLog(`Collected ${result.tweets.length} tweets from @${handle}`);
+
+  if (result.tweets.length > 0) {
+    // saveTweets 支持自定义输出目录
+    saveTweets(result.tweets, profileDir);
+    profileLog(`Saved to ${profileDir}`);
+  }
+
+  return {
+    handle,
+    tweetCount: result.tweets.length,
+    newestTime: result.newestTime || null,
+    oldestTime: result.oldestTime || null,
+  };
 }
 
 /**
@@ -298,10 +294,14 @@ if (require.main === module) {
   }
 
   (async () => {
-    if (doAnalyze) {
-      await analyzeProfile(handle, { days, maxTweets, model });
-    } else {
-      await scrapeProfile(handle, { maxScrolls });
+    try {
+      if (doAnalyze) {
+        await analyzeProfile(handle, { days, maxTweets, model });
+      } else {
+        await scrapeProfile(handle, { maxScrolls });
+      }
+    } finally {
+      await closeBrowser();
     }
   })().catch(console.error);
 }

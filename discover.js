@@ -2,7 +2,8 @@ const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
-const { launchBrowser, collectTweets, saveTweets, log } = require("./collect-timeline");
+const { collectTweets, saveTweets, log } = require("./collect-timeline");
+const { getBrowser, closeBrowser } = require("./browser");
 
 const dotenvResult = require("dotenv").config({ path: path.join(__dirname, ".env") });
 if (dotenvResult.parsed) {
@@ -409,6 +410,8 @@ async function checkFollowStatusBatch(page, tweets) {
  * 导航到 "为你推荐" (For You) 标签页
  */
 async function navigateToForYou(page) {
+  // 清除上一次任务残留的扫描数据
+  await page.evaluate(() => { window._tweetMap = new Map(); }).catch(() => {});
   log("[discover] Navigating to x.com/home ...");
   await page.goto("https://x.com/home", { waitUntil: "domcontentloaded" });
   await page.waitForTimeout(3000);
@@ -590,7 +593,7 @@ async function runDiscover(options = {}) {
   log("=== Starting account discovery ===");
 
   const maxScrolls = options.maxScrolls || config.discover.maxScrolls;
-  const browser = await launchBrowser();
+  const browser = await getBrowser();
   const page = browser.pages()[0] || (await browser.newPage());
 
   try {
@@ -623,8 +626,6 @@ async function runDiscover(options = {}) {
   } catch (err) {
     log(`[discover] Error: ${err.message}`);
     return null;
-  } finally {
-    await browser.close();
   }
 }
 
@@ -640,7 +641,7 @@ if (require.main === module) {
     if (args[i] === "--max-scrolls" && args[i + 1]) maxScrolls = parseInt(args[++i]);
   }
 
-  runDiscover({ maxScrolls }).then((result) => {
+  runDiscover({ maxScrolls }).then(async (result) => {
     if (result) {
       console.log("\n========== Discovery Summary ==========");
       console.log(`Tweets analyzed: ${result.tweetCount}`);
@@ -649,5 +650,9 @@ if (require.main === module) {
     } else {
       console.log("No results.");
     }
-  }).catch(console.error);
+    await closeBrowser();
+  }).catch(async (err) => {
+    console.error(err);
+    await closeBrowser();
+  });
 }

@@ -2,6 +2,10 @@ const http = require("http");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
+const taskQueue = require("./task-queue");
+const { setLogger, clearLogger } = require("./collect-timeline");
+const { getBrowser, isBrowserAlive, closeBrowser } = require("./browser");
+const scheduler = require("./scheduler");
 
 const PORT = config.dashboard?.port || 3456;
 
@@ -254,6 +258,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <div class="top-bar" id="top-bar">
     <h1>Timeline</h1>
     <div class="stat-inline" id="stats"></div>
+    <div id="browser-status" style="display:flex;align-items:center;gap:6px;font-size:13px"></div>
+    <div id="scheduler-status" style="display:flex;align-items:center;gap:12px;font-size:13px"></div>
     <div class="top-actions">
       <button class="btn" onclick="loadAll()">Refresh</button>
     </div>
@@ -261,7 +267,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   <div class="toolbar">
     <div class="view-tabs">
-      <div class="view-tab active" onclick="switchView('analyses')">Analysis Reports</div>
+      <div class="view-tab active" onclick="switchView('tasks')">Tasks</div>
+      <div class="view-tab" onclick="switchView('analyses')">Analysis Reports</div>
       <div class="view-tab" onclick="switchView('discovers')">Discover</div>
       <div class="view-tab" onclick="switchView('profiles')">Profiles</div>
       <div class="view-tab" onclick="switchView('stats')">Stats</div>
@@ -300,7 +307,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   <div class="toast" id="toast"></div>
 
 <script>
-  let currentView = 'analyses';
+  let currentView = 'tasks';
   let isExpanded = false;
 
   function showToast(msg, type) {
@@ -317,17 +324,18 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     document.getElementById('expand-btn').textContent = isExpanded ? 'Collapse' : 'Expand';
   }
 
-  const viewOrder = ['analyses', 'discovers', 'profiles', 'stats', 'tweets'];
+  const viewOrder = ['tasks', 'analyses', 'discovers', 'profiles', 'stats', 'tweets'];
   function switchView(view) {
     currentView = view;
     document.querySelectorAll('.view-tab').forEach((tab, i) => {
       tab.classList.toggle('active', viewOrder[i] === view);
     });
-    const isStats = view === 'stats';
-    document.getElementById('file-list').style.display = isStats ? 'none' : '';
-    document.getElementById('main-layout').style.gridTemplateColumns = isStats ? '1fr' : '280px 1fr';
+    const fullWidth = view === 'stats' || view === 'tasks';
+    document.getElementById('file-list').style.display = fullWidth ? 'none' : '';
+    document.getElementById('main-layout').style.gridTemplateColumns = fullWidth ? '1fr' : '280px 1fr';
     document.getElementById('content-header').style.display = 'none';
-    if (view === 'analyses') { loadAnalyses(); document.getElementById('content-area').innerHTML = '<div class="placeholder">Select an item to view</div>'; }
+    if (view === 'tasks') loadTasks();
+    else if (view === 'analyses') { loadAnalyses(); document.getElementById('content-area').innerHTML = '<div class="placeholder">Select an item to view</div>'; }
     else if (view === 'discovers') { loadDiscovers(); document.getElementById('content-area').innerHTML = '<div class="placeholder">Select an item to view</div>'; }
     else if (view === 'profiles') { loadProfiles(); document.getElementById('content-area').innerHTML = '<div class="placeholder">Select a profile or scrape a new one</div>'; }
     else if (view === 'stats') loadStats();
@@ -336,7 +344,10 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   async function loadAll() {
     await loadStatus();
-    if (currentView === 'analyses') loadAnalyses();
+    loadBrowserStatus();
+    loadSchedulerStatus();
+    if (currentView === 'tasks') loadTasks();
+    else if (currentView === 'analyses') loadAnalyses();
     else if (currentView === 'discovers') loadDiscovers();
     else if (currentView === 'profiles') loadProfiles();
     else if (currentView === 'stats') loadStats();
@@ -446,23 +457,18 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
   }
 
   async function runDiscoverNow() {
-    const btn = document.getElementById('discover-run-btn');
-    if (btn) { btn.classList.add('running'); btn.disabled = true; btn.textContent = 'Running...'; }
-    showToast('Starting account discovery ...', '');
     try {
       const res = await fetch('/api/discover', { method: 'POST' });
       const data = await res.json();
       if (data.error) {
         showToast('Discover failed: ' + data.error, 'error');
       } else {
-        showToast('Discover complete! ' + data.tweetCount + ' tweets analyzed.', 'success');
-        await loadAll();
-        if (data.filename) loadDiscover(data.filename, null);
+        const msg = data.status === 'queued' ? 'Discovery queued (browser busy).' : 'Discovery started.';
+        showToast(msg + ' Check Tasks tab.', 'success');
+        switchView('tasks');
       }
     } catch (err) {
       showToast('Request failed: ' + err.message, 'error');
-    } finally {
-      if (btn) { btn.classList.remove('running'); btn.disabled = false; btn.textContent = 'Run Now'; }
     }
   }
 
@@ -625,9 +631,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       hours = parseFloat(document.getElementById('custom-hours').value);
       if (!hours || hours <= 0) { showToast('Please enter valid hours', 'error'); return; }
     }
-    const btns = document.querySelectorAll('.analyze-btn');
-    btns.forEach(b => { b.classList.add('running'); b.disabled = true; });
-    showToast('Running analysis for ' + hours + 'h ...', '');
     try {
       const res = await fetch('/api/analyze', {
         method: 'POST',
@@ -638,14 +641,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if (data.error) {
         showToast('Analysis failed: ' + data.error, 'error');
       } else {
-        showToast('Analysis complete! ' + data.tweetCount + ' tweets analyzed.', 'success');
-        await loadAll();
-        if (data.filename) loadAnalysis(data.filename, null);
+        showToast('Analysis task started. Check Tasks tab for progress.', 'success');
+        switchView('tasks');
       }
     } catch (err) {
       showToast('Request failed: ' + err.message, 'error');
-    } finally {
-      btns.forEach(b => { b.classList.remove('running'); b.disabled = false; });
     }
   }
 
@@ -686,10 +686,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     if (!handle) { showToast('Please enter a handle', 'error'); return; }
     const maxScrolls = parseInt(document.getElementById('profile-scrolls').value) || 50;
 
-    const btn = document.getElementById('profile-scrape-btn');
-    btn.classList.add('running'); btn.disabled = true; btn.textContent = 'Scraping...';
-    showToast('Scraping @' + handle + ' ...', '');
-
     try {
       const res = await fetch('/api/profile/scrape', {
         method: 'POST',
@@ -700,14 +696,12 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if (data.error) {
         showToast('Scrape failed: ' + data.error, 'error');
       } else {
-        showToast('Scraped ' + data.tweetCount + ' tweets from @' + handle, 'success');
-        await loadProfiles();
-        selectProfile(handle, null);
+        const msg = data.status === 'queued' ? 'Scrape queued (browser busy).' : 'Scrape started.';
+        showToast(msg + ' Check Tasks tab.', 'success');
+        switchView('tasks');
       }
     } catch (err) {
       showToast('Request failed: ' + err.message, 'error');
-    } finally {
-      btn.classList.remove('running'); btn.disabled = false; btn.textContent = 'Scrape';
     }
   }
 
@@ -784,10 +778,6 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     const maxTweets = parseInt(document.getElementById('profile-max-tweets').value) || 500;
     const model = document.getElementById('profile-model').value;
 
-    const btn = document.getElementById('profile-analyze-btn');
-    btn.classList.add('running'); btn.disabled = true; btn.textContent = 'Analyzing...';
-    showToast('Analyzing @' + _selectedProfile + ' ...', '');
-
     try {
       const res = await fetch('/api/profile/analyze', {
         method: 'POST',
@@ -798,14 +788,11 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       if (data.error) {
         showToast('Analysis failed: ' + data.error, 'error');
       } else {
-        showToast('Analysis complete! ' + data.tweetCount + ' tweets analyzed.', 'success');
-        selectProfile(_selectedProfile, null);
-        if (data.filename) loadProfileReport(_selectedProfile, data.filename, null);
+        showToast('Analysis started. Check Tasks tab.', 'success');
+        switchView('tasks');
       }
     } catch (err) {
       showToast('Request failed: ' + err.message, 'error');
-    } finally {
-      btn.classList.remove('running'); btn.disabled = false; btn.textContent = 'Analyze';
     }
   }
 
@@ -824,6 +811,263 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     }
   }
 
+  // ========== Browser Status & Task Queue ==========
+
+  let _taskPollTimer = null;
+
+  async function loadBrowserStatus() {
+    try {
+      const [taskRes, browserRes] = await Promise.all([
+        fetch('/api/tasks/status'),
+        fetch('/api/browser-status')
+      ]);
+      const s = await taskRes.json();
+      const b = await browserRes.json();
+      const el = document.getElementById('browser-status');
+      if (!el) return;
+
+      let html = '';
+      if (s.browserBusy) {
+        const elapsed = s.currentStartedAt ? formatElapsed(new Date(s.currentStartedAt)) : '';
+        html = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#f59e0b"></span>' +
+          '<span style="color:#f59e0b">' + (s.currentLabel || s.currentOperation) + '</span>' +
+          (elapsed ? '<span style="color:#71767b">(' + elapsed + ')</span>' : '') +
+          (s.queuedCount > 0 ? '<span style="color:#71767b;margin-left:4px">+' + s.queuedCount + ' queued</span>' : '');
+      } else if (b.alive) {
+        html = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#00ba7c"></span>' +
+          '<span style="color:#71767b">Browser: idle</span>' +
+          '<button class="btn" style="padding:2px 8px;font-size:12px;margin-left:4px" onclick="closeBrowserAction()">Close</button>';
+      } else {
+        html = '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:#71767b"></span>' +
+          '<span style="color:#71767b">Browser: offline</span>' +
+          '<button class="btn" style="padding:2px 8px;font-size:12px;margin-left:4px" onclick="launchBrowserAction()">Launch</button>';
+      }
+      el.innerHTML = html;
+    } catch {}
+  }
+
+  async function launchBrowserAction() {
+    const el = document.getElementById('browser-status');
+    if (el) el.innerHTML = '<span style="color:#71767b">Launching...</span>';
+    try {
+      await fetch('/api/browser-launch', { method: 'POST' });
+    } catch {}
+    setTimeout(loadBrowserStatus, 1000);
+  }
+
+  async function closeBrowserAction() {
+    try {
+      await fetch('/api/browser-close', { method: 'POST' });
+    } catch {}
+    setTimeout(loadBrowserStatus, 500);
+  }
+
+  // ========== Scheduler Toggles ==========
+
+  async function loadSchedulerStatus() {
+    try {
+      const res = await fetch('/api/scheduler');
+      const s = await res.json();
+      const el = document.getElementById('scheduler-status');
+      if (!el) return;
+
+      function toggleHtml(label, key, enabled, nextRunAt) {
+        const color = enabled ? '#00ba7c' : '#71767b';
+        const text = enabled ? 'ON' : 'OFF';
+        let countdown = '';
+        if (enabled && nextRunAt) {
+          const diff = Math.max(0, Math.floor((new Date(nextRunAt).getTime() - Date.now()) / 1000));
+          const m = Math.floor(diff / 60);
+          const sec = diff % 60;
+          countdown = ' <span style="color:#71767b">(' + m + 'm ' + sec + 's)</span>';
+        }
+        return '<span style="cursor:pointer;user-select:none" onclick="toggleScheduler(&apos;' + key + '&apos;, ' + !enabled + ')">' +
+          '<span style="display:inline-block;width:8px;height:8px;border-radius:50%;background:' + color + ';margin-right:4px"></span>' +
+          '<span style="color:' + color + '">' + label + ': ' + text + '</span>' + countdown + '</span>';
+      }
+
+      el.innerHTML = toggleHtml('Collect', 'collect', s.collect.enabled, s.collect.nextRunAt) +
+        toggleHtml('Discover', 'discover', s.discover.enabled, s.discover.nextRunAt);
+    } catch {}
+  }
+
+  async function toggleScheduler(key, enabled) {
+    try {
+      await fetch('/api/scheduler/' + key, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ enabled })
+      });
+    } catch {}
+    loadSchedulerStatus();
+  }
+
+  function formatElapsed(startDate) {
+    const diff = Math.floor((Date.now() - startDate.getTime()) / 1000);
+    if (diff < 60) return diff + 's';
+    const m = Math.floor(diff / 60);
+    const s = diff % 60;
+    if (m < 60) return m + 'm ' + s + 's';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + (m % 60) + 'm';
+  }
+
+  function formatDuration(start, end) {
+    const diff = Math.floor((end.getTime() - start.getTime()) / 1000);
+    if (diff < 60) return diff + 's';
+    const m = Math.floor(diff / 60);
+    const s = diff % 60;
+    if (m < 60) return m + 'm ' + s + 's';
+    const h = Math.floor(m / 60);
+    return h + 'h ' + (m % 60) + 'm';
+  }
+
+  function statusBadge(status) {
+    const colors = { running: '#f59e0b', queued: '#71767b', completed: '#00ba7c', failed: '#f4212e' };
+    const c = colors[status] || '#71767b';
+    return '<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:' + c + '22;color:' + c + ';border:1px solid ' + c + '44">' + status + '</span>';
+  }
+
+  function operationIcon(op) {
+    const icons = { collection: '📥', discover: '🔍', 'profile-scrape': '👤', analyze: '📊', 'profile-analyze': '📝' };
+    return icons[op] || '⚙️';
+  }
+
+  async function loadTasks() {
+    const area = document.getElementById('content-area');
+    area.innerHTML = '<div style="padding:20px;color:#71767b">Loading tasks...</div>';
+
+    try {
+      const [tasksRes, statusRes] = await Promise.all([
+        fetch('/api/tasks'),
+        fetch('/api/tasks/status')
+      ]);
+      const tasks = await tasksRes.json();
+      const status = await statusRes.json();
+
+      const running = tasks.filter(t => t.status === 'running');
+      const queued = tasks.filter(t => t.status === 'queued');
+      const completed = tasks.filter(t => t.status === 'completed' || t.status === 'failed');
+
+      let html = '<div style="padding:24px 36px;max-width:1200px">';
+
+      // Running tasks
+      html += '<h2 style="font-size:18px;margin-bottom:16px">Running</h2>';
+      if (running.length === 0) {
+        html += '<div style="color:#71767b;margin-bottom:24px;padding:16px;background:#16202a;border:1px solid #2f3336;border-radius:12px">No tasks running</div>';
+      } else {
+        for (const t of running) {
+          const elapsed = t.startedAt ? formatElapsed(new Date(t.startedAt)) : '';
+          html += '<div style="background:#16202a;border:1px solid #2f3336;border-radius:12px;padding:16px;margin-bottom:12px">' +
+            '<div style="display:flex;align-items:center;gap:10px;margin-bottom:10px">' +
+              '<span style="font-size:18px">' + operationIcon(t.operation) + '</span>' +
+              statusBadge(t.status) +
+              '<span style="color:#e7e9ea;font-weight:600">' + t.label + '</span>' +
+              '<span style="color:#71767b;margin-left:auto;font-size:13px">' + elapsed + '</span>' +
+            '</div>' +
+            '<div id="task-logs-' + t.id + '" style="background:#0f1419;border:1px solid #2f3336;border-radius:8px;padding:10px;max-height:300px;overflow-y:auto;font-family:monospace;font-size:12px;color:#71767b;line-height:1.6">' +
+              renderLogs(t.logs) +
+            '</div>' +
+          '</div>';
+        }
+      }
+
+      // Queued tasks
+      if (queued.length > 0) {
+        html += '<h2 style="font-size:18px;margin-bottom:16px;margin-top:24px">Queued (' + queued.length + ')</h2>';
+        for (const t of queued) {
+          const waitTime = formatElapsed(new Date(t.createdAt));
+          html += '<div style="background:#16202a;border:1px solid #2f3336;border-radius:12px;padding:12px 16px;margin-bottom:8px;display:flex;align-items:center;gap:10px">' +
+            '<span style="font-size:16px">' + operationIcon(t.operation) + '</span>' +
+            statusBadge(t.status) +
+            '<span style="color:#e7e9ea">' + t.label + '</span>' +
+            '<span style="color:#71767b;margin-left:auto;font-size:12px">waiting ' + waitTime + '</span>' +
+          '</div>';
+        }
+      }
+
+      // Completed tasks
+      if (completed.length > 0) {
+        html += '<h2 style="font-size:18px;margin-bottom:16px;margin-top:24px">Recent (' + completed.length + ')</h2>';
+        for (const t of completed) {
+          const duration = t.startedAt && t.completedAt
+            ? formatDuration(new Date(t.startedAt), new Date(t.completedAt))
+            : '';
+          const timeStr = t.completedAt ? toUTC8(t.completedAt).slice(5, 16) : '';
+          html += '<div style="background:#16202a;border:1px solid #2f3336;border-radius:12px;padding:12px 16px;margin-bottom:8px">' +
+            '<div style="display:flex;align-items:center;gap:10px;cursor:pointer" onclick="toggleTaskLogs(this)">' +
+              '<span style="font-size:16px">' + operationIcon(t.operation) + '</span>' +
+              statusBadge(t.status) +
+              '<span style="color:#e7e9ea">' + t.label + '</span>' +
+              (t.error ? '<span style="color:#f4212e;font-size:12px">' + t.error + '</span>' : '') +
+              '<span style="color:#71767b;margin-left:auto;font-size:12px">' + duration + ' | ' + timeStr + '</span>' +
+              '<span style="color:#71767b;font-size:10px">▼</span>' +
+            '</div>' +
+            '<div style="display:none;margin-top:10px;background:#0f1419;border:1px solid #2f3336;border-radius:8px;padding:10px;max-height:200px;overflow-y:auto;font-family:monospace;font-size:12px;color:#71767b;line-height:1.6">' +
+              renderLogs(t.logs) +
+            '</div>' +
+          '</div>';
+        }
+      }
+
+      html += '</div>';
+      area.innerHTML = html;
+
+      // Auto-scroll running task logs to bottom
+      for (const t of running) {
+        const logEl = document.getElementById('task-logs-' + t.id);
+        if (logEl) logEl.scrollTop = logEl.scrollHeight;
+      }
+
+      // Start polling if there are running/queued tasks
+      if (running.length > 0 || queued.length > 0) {
+        startTaskPoll();
+      } else {
+        stopTaskPoll();
+      }
+
+    } catch (err) {
+      area.innerHTML = '<div style="padding:20px;color:#f4212e">Failed to load tasks: ' + err.message + '</div>';
+    }
+  }
+
+  function renderLogs(logs) {
+    if (!logs || logs.length === 0) return '<span style="color:#555">No logs yet...</span>';
+    const recent = logs.slice(-100); // show last 100 in UI
+    return recent.map(l => {
+      const time = l.time ? new Date(new Date(l.time).getTime() + 8*3600000).toISOString().slice(11, 19) : '';
+      const isError = l.message && l.message.startsWith('ERROR');
+      return '<div' + (isError ? ' style="color:#f4212e"' : '') + '><span style="color:#555">[' + time + ']</span> ' + escapeHtml(l.message) + '</div>';
+    }).join('');
+  }
+
+  function escapeHtml(s) {
+    return s.replace(/&/g,'&amp;').replace(/</g,'&lt;').replace(/>/g,'&gt;');
+  }
+
+  function toggleTaskLogs(header) {
+    const logsDiv = header.nextElementSibling;
+    if (logsDiv) {
+      logsDiv.style.display = logsDiv.style.display === 'none' ? 'block' : 'none';
+    }
+  }
+
+  function startTaskPoll() {
+    if (_taskPollTimer) return;
+    _taskPollTimer = setInterval(() => {
+      if (currentView === 'tasks') loadTasks();
+      loadBrowserStatus();
+      loadSchedulerStatus();
+    }, 3000);
+  }
+
+  function stopTaskPoll() {
+    if (_taskPollTimer) {
+      clearInterval(_taskPollTimer);
+      _taskPollTimer = null;
+    }
+  }
+
   // Auto-collapse top bar on report scroll
   document.querySelector('.panel-content').addEventListener('scroll', function() {
     const bar = document.getElementById('top-bar');
@@ -833,6 +1077,9 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
 
   // Initial load
   loadAll();
+  loadSchedulerStatus();
+  // Poll browser + scheduler status every 5s
+  setInterval(() => { loadBrowserStatus(); loadSchedulerStatus(); }, 5000);
 </script>
 </body>
 </html>`;
@@ -875,21 +1122,26 @@ const server = http.createServer((req, res) => {
   if (url.pathname === "/api/analyze" && req.method === "POST") {
     let body = "";
     req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
+    req.on("end", () => {
       try {
         const { hours, model } = JSON.parse(body);
-        const { runAnalysis } = require("./analyze");
-        const result = await runAnalysis(hours || 2, model);
-        if (!result) {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "No tweets found in this time range" }));
-        } else {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({
-            filename: path.basename(result.filepath),
-            tweetCount: result.tweetCount,
-          }));
-        }
+        const h = hours || 2;
+        const { task } = taskQueue.enqueue(
+          { type: "analysis", operation: "analyze", label: `Timeline analysis (${h}h)` },
+          async ({ log }) => {
+            log(`Starting analysis for ${h}h...`);
+            const { runAnalysis } = require("./analyze");
+            const result = await runAnalysis(h, model);
+            if (!result) {
+              log("No tweets found in this time range");
+              return null;
+            }
+            log(`Analysis complete: ${result.tweetCount} tweets`);
+            return { filename: path.basename(result.filepath), tweetCount: result.tweetCount };
+          }
+        );
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ taskId: task.id, status: "started" }));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -899,26 +1151,38 @@ const server = http.createServer((req, res) => {
   }
 
   if (url.pathname === "/api/discover" && req.method === "POST") {
-    res.writeHead(200, { "Content-Type": "application/json" });
-    (async () => {
-      try {
-        const { runDiscover } = require("./discover");
-        const result = await runDiscover();
-        if (!result) {
-          res.end(JSON.stringify({ error: "No tweets collected from For You" }));
-        } else {
-          // 更新 state 的 lastDiscoverTime
+    try {
+      const { task } = taskQueue.enqueue(
+        { type: "browser", operation: "discover", label: "Account discovery (manual)" },
+        async ({ log }) => {
+          setLogger(log);
           try {
-            const stateData = JSON.parse(fs.readFileSync(config.stateFile, "utf-8"));
-            stateData.lastDiscoverTime = new Date().toISOString();
-            fs.writeFileSync(config.stateFile, JSON.stringify(stateData, null, 2), "utf-8");
-          } catch {}
-          res.end(JSON.stringify({ filename: result.filename, tweetCount: result.tweetCount }));
+            log("Starting account discovery...");
+            const { runDiscover } = require("./discover");
+            const result = await runDiscover();
+            if (!result) {
+              log("No tweets collected from For You");
+              return null;
+            }
+            // 更新 state 的 lastDiscoverTime
+            try {
+              const stateData = JSON.parse(fs.readFileSync(config.stateFile, "utf-8"));
+              stateData.lastDiscoverTime = new Date().toISOString();
+              fs.writeFileSync(config.stateFile, JSON.stringify(stateData, null, 2), "utf-8");
+            } catch {}
+            log(`Discovery complete: ${result.tweetCount} tweets analyzed`);
+            return { filename: result.filename, tweetCount: result.tweetCount };
+          } finally {
+            clearLogger();
+          }
         }
-      } catch (err) {
-        res.end(JSON.stringify({ error: err.message }));
-      }
-    })();
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ taskId: task.id, status: task.status }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 
@@ -946,14 +1210,28 @@ const server = http.createServer((req, res) => {
   if (url.pathname === "/api/profile/scrape" && req.method === "POST") {
     let body = "";
     req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
+    req.on("end", () => {
       try {
         const { handle, maxScrolls } = JSON.parse(body);
         if (!handle) throw new Error("handle is required");
-        const { scrapeProfile } = require("./profile");
-        const result = await scrapeProfile(handle, { maxScrolls });
+        const scrolls = maxScrolls || config.profile.maxScrolls;
+        const { task } = taskQueue.enqueue(
+          { type: "browser", operation: "profile-scrape", label: `Scrape @${handle} (${scrolls} scrolls)` },
+          async ({ log }) => {
+            setLogger(log);
+            try {
+              log(`Starting scrape of @${handle}...`);
+              const { scrapeProfile } = require("./profile");
+              const result = await scrapeProfile(handle, { maxScrolls: scrolls });
+              log(`Scraped ${result.tweetCount} tweets from @${handle}`);
+              return result;
+            } finally {
+              clearLogger();
+            }
+          }
+        );
         res.writeHead(200, { "Content-Type": "application/json" });
-        res.end(JSON.stringify(result));
+        res.end(JSON.stringify({ taskId: task.id, status: task.status }));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -965,19 +1243,26 @@ const server = http.createServer((req, res) => {
   if (url.pathname === "/api/profile/analyze" && req.method === "POST") {
     let body = "";
     req.on("data", chunk => body += chunk);
-    req.on("end", async () => {
+    req.on("end", () => {
       try {
         const { handle, days, maxTweets, model } = JSON.parse(body);
         if (!handle) throw new Error("handle is required");
-        const { analyzeProfile } = require("./profile");
-        const result = await analyzeProfile(handle, { days, maxTweets, model });
-        if (!result) {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ error: "No tweets found for this user" }));
-        } else {
-          res.writeHead(200, { "Content-Type": "application/json" });
-          res.end(JSON.stringify({ handle: result.handle, filename: result.filename, tweetCount: result.tweetCount }));
-        }
+        const { task } = taskQueue.enqueue(
+          { type: "analysis", operation: "profile-analyze", label: `Analyze @${handle}` },
+          async ({ log }) => {
+            log(`Starting analysis of @${handle}...`);
+            const { analyzeProfile } = require("./profile");
+            const result = await analyzeProfile(handle, { days, maxTweets, model });
+            if (!result) {
+              log("No tweets found for this user");
+              return null;
+            }
+            log(`Analysis complete: ${result.tweetCount} tweets analyzed`);
+            return { handle: result.handle, filename: result.filename, tweetCount: result.tweetCount };
+          }
+        );
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ taskId: task.id, status: "started" }));
       } catch (err) {
         res.writeHead(500, { "Content-Type": "application/json" });
         res.end(JSON.stringify({ error: err.message }));
@@ -1031,6 +1316,109 @@ const server = http.createServer((req, res) => {
       res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" });
       res.end(content);
     }
+    return;
+  }
+
+  // ========== Task Queue API Routes ==========
+
+  if (url.pathname === "/api/tasks") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(taskQueue.getAll()));
+    return;
+  }
+
+  if (url.pathname === "/api/tasks/status") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(taskQueue.getStatus()));
+    return;
+  }
+
+  const taskMatch = url.pathname.match(/^\/api\/tasks\/(.+)$/);
+  if (taskMatch && taskMatch[1] !== "status") {
+    const task = taskQueue.getTask(decodeURIComponent(taskMatch[1]));
+    if (!task) {
+      res.writeHead(404, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: "Task not found" }));
+    } else {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify(task));
+    }
+    return;
+  }
+
+  // 浏览器状态
+  if (url.pathname === "/api/browser-status") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify({ alive: isBrowserAlive() }));
+    return;
+  }
+
+  // 手动启动浏览器
+  if (url.pathname === "/api/browser-launch" && req.method === "POST") {
+    getBrowser().then(() => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
+  }
+
+  // 关闭浏览器
+  if (url.pathname === "/api/browser-close" && req.method === "POST") {
+    closeBrowser().then(() => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ status: "ok" }));
+    }).catch((err) => {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    });
+    return;
+  }
+
+  // 调度器状态
+  if (url.pathname === "/api/scheduler") {
+    res.writeHead(200, { "Content-Type": "application/json" });
+    res.end(JSON.stringify(scheduler.getSchedulerStatus()));
+    return;
+  }
+
+  // 开关自动采集
+  if (url.pathname === "/api/scheduler/collect" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const { enabled } = JSON.parse(body);
+        if (enabled) scheduler.startAutoCollect();
+        else scheduler.stopAutoCollect();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(scheduler.getSchedulerStatus()));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
+    return;
+  }
+
+  // 开关自动发现
+  if (url.pathname === "/api/scheduler/discover" && req.method === "POST") {
+    let body = "";
+    req.on("data", (c) => (body += c));
+    req.on("end", () => {
+      try {
+        const { enabled } = JSON.parse(body);
+        if (enabled) scheduler.startAutoDiscover();
+        else scheduler.stopAutoDiscover();
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(scheduler.getSchedulerStatus()));
+      } catch (err) {
+        res.writeHead(400, { "Content-Type": "application/json" });
+        res.end(JSON.stringify({ error: err.message }));
+      }
+    });
     return;
   }
 

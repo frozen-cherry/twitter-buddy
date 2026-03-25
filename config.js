@@ -107,6 +107,12 @@ module.exports = {
 请特别关注：加密货币交易观点、市场判断、技术分析的质量和准确性。`,
   },
 
+  // 任务队列配置
+  tasks: {
+    maxCompletedTasks: 20,   // 保留最近 20 个已完成任务
+    maxLogsPerTask: 500,     // 每个任务最多 500 条日志
+  },
+
   // Dashboard 配置
   dashboard: { port: 3456 },
 
