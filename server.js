@@ -275,6 +275,8 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <div class="view-tab" onclick="switchView('tweets')">Tweet Data Files</div>
     </div>
     <div class="analyze-bar">
+      <button class="analyze-btn" onclick="runCollectNow()" title="Run one collection cycle now">Collect Now</button>
+      <span style="margin:0 6px;color:#333640">|</span>
       <span class="label">Analyze:</span>
       <button class="analyze-btn" onclick="runAnalyze(1)">1h</button>
       <button class="analyze-btn" onclick="runAnalyze(2)">2h</button>
@@ -624,6 +626,21 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
     document.getElementById('content-header').style.display = 'flex';
     document.getElementById('content-title').textContent = filename;
     document.getElementById('content-area').innerHTML = '<div class="md-content"><h2>' + filename + '</h2><p>File path: <code>data/tweets/' + filename + '</code></p></div>';
+  }
+
+  async function runCollectNow() {
+    try {
+      const res = await fetch('/api/collect', { method: 'POST' });
+      const data = await res.json();
+      if (data.error) {
+        showToast('Collect failed: ' + data.error, 'error');
+      } else {
+        showToast('Collection task queued');
+        if (currentView === 'tasks') loadTasks();
+      }
+    } catch (err) {
+      showToast('Request failed', 'error');
+    }
   }
 
   async function runAnalyze(hours) {
@@ -1147,6 +1164,52 @@ const server = http.createServer((req, res) => {
         res.end(JSON.stringify({ error: err.message }));
       }
     });
+    return;
+  }
+
+  // 手动触发一次采集
+  if (url.pathname === "/api/collect" && req.method === "POST") {
+    try {
+      const state = scheduler.loadState();
+      const { task } = taskQueue.enqueue(
+        { type: "browser", operation: "collection", label: "Manual collect timeline" },
+        async ({ log: taskLog }) => {
+          setLogger(taskLog);
+          try {
+            taskLog("=== Starting manual collection ===");
+            const { getBrowser } = require("./browser");
+            const { navigateToTimeline, collectTweets, saveTweets } = require("./collect-timeline");
+            const browser = await getBrowser();
+            const page = browser.pages()[0] || (await browser.newPage());
+            await navigateToTimeline(page);
+            const result = await collectTweets(page, {
+              stopAtTimestamp: state.lastNewestTweet,
+            });
+            if (result.tweets.length === 0) {
+              taskLog("No tweets collected.");
+              return { tweetCount: 0 };
+            }
+            saveTweets(result.tweets, config.tweetsDir);
+            if (state.lastNewestTweet && !result.reachedTarget) {
+              taskLog(`GAP DETECTED: ${state.lastNewestTweet} ~ ${result.oldestTime}`);
+            }
+            state.lastNewestTweet = result.newestTime;
+            state.lastCollectionTime = new Date().toISOString();
+            state.totalCollected += result.tweets.length;
+            scheduler.saveState(state);
+            taskLog(`Complete: ${result.tweets.length} new tweets (total: ${state.totalCollected})`);
+            return { tweetCount: result.tweets.length };
+          } finally {
+            clearLogger();
+          }
+        }
+      );
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ taskId: task.id, status: task.status }));
+    } catch (err) {
+      res.writeHead(500, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: err.message }));
+    }
     return;
   }
 
