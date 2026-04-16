@@ -1,17 +1,10 @@
-const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
 const { collectTweets, saveTweets, log } = require("./collect-timeline");
 const { getBrowser, closeBrowser } = require("./browser");
 const { buildTweetSummary } = require("./analyze");
-
-const dotenvResult = require("dotenv").config({ path: path.join(__dirname, ".env") });
-if (dotenvResult.parsed) {
-  for (const [k, v] of Object.entries(dotenvResult.parsed)) {
-    if (!process.env[k]) process.env[k] = v;
-  }
-}
+const { callClaude } = require("./claude-cli");
 
 function profileLog(msg) {
   const ts = new Date().toLocaleTimeString();
@@ -142,26 +135,14 @@ async function analyzeProfile(handle, options = {}) {
   const tweetSummary = buildTweetSummary(tweets);
   const useModel = options.model || config.profile.model;
 
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-
-  profileLog(`Calling Claude API (${useModel}) ...`);
+  profileLog(`Calling claude CLI (${useModel}) ...`);
 
   const timeRange = tweets.length > 0
     ? `${tweets[tweets.length - 1].time} ~ ${tweets[0].time}`
     : "N/A";
 
-  const message = await client.messages.create({
-    model: useModel,
-    max_tokens: config.profile.maxTokens,
-    messages: [
-      {
-        role: "user",
-        content: `${config.profile.prompt}\n\n---\n\n用户：@${handle}\n推文数量：${tweets.length}\n时间范围：${timeRange}\n\n${tweetSummary}`,
-      },
-    ],
-  });
-
-  const analysisText = message.content[0].text;
+  const userContent = `${config.profile.prompt}\n\n---\n\n用户：@${handle}\n推文数量：${tweets.length}\n时间范围：${timeRange}\n\n${tweetSummary}`;
+  const analysisText = await callClaude(userContent, { model: useModel });
 
   // 保存报告
   const now = new Date(Date.now() + 8 * 60 * 60 * 1000);

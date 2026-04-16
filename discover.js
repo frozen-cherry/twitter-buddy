@@ -1,16 +1,9 @@
-const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
 const { collectTweets, saveTweets, log } = require("./collect-timeline");
 const { getBrowser, closeBrowser } = require("./browser");
-
-const dotenvResult = require("dotenv").config({ path: path.join(__dirname, ".env") });
-if (dotenvResult.parsed) {
-  for (const [k, v] of Object.entries(dotenvResult.parsed)) {
-    if (!process.env[k]) process.env[k] = v;
-  }
-}
+const { callClaude } = require("./claude-cli");
 
 // ========== 用户评分系统 ==========
 
@@ -512,20 +505,13 @@ async function analyzeForDiscover(tweets) {
   const tweetUsers = tweets.map(t => t.user);
   const scoresSummary = buildScoresSummary(existingScores, tweetUsers);
 
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
   const discoverPrompt = config.discover.prompt;
+  const useModel = config.discover.model || config.analysis.model;
 
   const userContent = `${discoverPrompt}${scoresSummary}\n\n---\n\n以下是从"为你推荐"采集到的 ${tweets.length} 条推文：\n\n${tweetSummary}`;
 
-  const message = await client.messages.create({
-    model: config.discover.model || config.analysis.model,
-    max_tokens: config.discover.maxTokens || config.analysis.maxTokens,
-    messages: [
-      { role: "user", content: userContent },
-    ],
-  });
-
-  const analysisText = message.content[0].text;
+  log(`[discover] Calling claude CLI (${useModel}) ...`);
+  const analysisText = await callClaude(userContent, { model: useModel });
 
   // 解析 LLM 输出中的评分
   const newScoreDeltas = parseScoresFromAnalysis(analysisText);

@@ -1,15 +1,7 @@
-const Anthropic = require("@anthropic-ai/sdk");
 const fs = require("fs");
 const path = require("path");
 const config = require("./config");
-
-const dotenvResult = require("dotenv").config({ path: path.join(__dirname, ".env") });
-if (dotenvResult.parsed) {
-  // Manually assign in case dotenv fails to set process.env (Windows edge case)
-  for (const [k, v] of Object.entries(dotenvResult.parsed)) {
-    if (!process.env[k]) process.env[k] = v;
-  }
-}
+const { callClaude } = require("./claude-cli");
 
 function log(msg) {
   const ts = new Date().toLocaleTimeString();
@@ -95,22 +87,10 @@ async function runAnalysis(hoursAgo, model) {
 
   const tweetSummary = buildTweetSummary(tweets);
 
-  const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
+  log(`Calling claude CLI (${useModel}) ...`);
 
-  log(`Calling Claude API (${useModel}) ...`);
-
-  const message = await client.messages.create({
-    model: useModel,
-    max_tokens: config.analysis.maxTokens,
-    messages: [
-      {
-        role: "user",
-        content: `${config.analysis.prompt}\n\n---\n\n以下是最近 ${hoursAgo} 小时的 ${tweets.length} 条推文：\n\n${tweetSummary}`,
-      },
-    ],
-  });
-
-  const analysisText = message.content[0].text;
+  const userContent = `${config.analysis.prompt}\n\n---\n\n以下是最近 ${hoursAgo} 小时的 ${tweets.length} 条推文：\n\n${tweetSummary}`;
+  const analysisText = await callClaude(userContent, { model: useModel });
 
   // 保存分析结果
   fs.mkdirSync(config.analysisDir, { recursive: true });

@@ -18,7 +18,7 @@ Your personal Twitter/X assistant that automatically scrolls your timeline, coll
 
 - Node.js 18+
 - Google Chrome installed
-- [Anthropic API key](https://console.anthropic.com/)
+- [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) installed and logged in (`claude /login`) — analysis runs through `claude -p` (no API key needed)
 
 ## Setup
 
@@ -27,12 +27,6 @@ git clone https://github.com/YOUR_USERNAME/twitter-buddy.git
 cd twitter-buddy
 npm install
 npx playwright install-deps
-```
-
-Create a `.env` file:
-
-```
-ANTHROPIC_API_KEY=sk-ant-xxxxx
 ```
 
 Log in to Twitter (opens a Chrome window, log in manually, then close it):
@@ -150,7 +144,7 @@ xvfb-run node daemon.js
 ## Tech Stack
 
 - [Playwright](https://playwright.dev/) — Browser automation
-- [Claude API](https://docs.anthropic.com/) — AI analysis
+- [Claude Code CLI](https://docs.claude.com/en/docs/claude-code) (`claude -p`) — AI analysis
 - Vanilla Node.js HTTP server — Dashboard (zero dependencies)
 
 ---
@@ -174,8 +168,8 @@ xvfb-run node daemon.js
 npm install
 npx playwright install-deps
 
-# 配置 API Key
-echo "ANTHROPIC_API_KEY=sk-ant-xxxxx" > .env
+# 确保 Claude Code CLI 已安装并登录（分析走 claude -p，无需 API Key）
+claude /login
 
 # 登录推特（手动登录后关闭浏览器）
 npm run login
@@ -224,4 +218,4 @@ node profile.js --handle cissan_9984 --analyze --days 30  # 分析
 
 ### 数据安全
 
-所有数据本地存储，不上传任何地方。`.env`（API Key）和 `.chrome-profile`（登录态）已在 `.gitignore` 中排除。
+所有数据本地存储，不上传任何地方。`.chrome-profile`（推特登录态）已在 `.gitignore` 中排除。
