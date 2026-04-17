@@ -26,7 +26,7 @@ module.exports = {
 
   // LLM 分析配置
   analysis: {
-    model: "claude-opus-4-6",
+    model: "claude-opus-4-7",
     maxTokens: 4096,
     analysisHours: 2, // 分析最近几小时的推文
     prompt: `你是一个推特时间线分析助手。以下是最近一段时间采集到的推文数据（JSON 格式）。
