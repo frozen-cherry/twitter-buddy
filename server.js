@@ -285,6 +285,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       <button class="analyze-btn" onclick="runAnalyze(null)">Go</button>
       <span class="label" style="margin-left:12px">Model:</span>
       <select class="model-select" id="model-select">
+        <option value="claude-opus-4-7">Opus 4.7</option>
         <option value="claude-opus-4-6">Opus 4.6</option>
         <option value="claude-sonnet-4-6">Sonnet 4.6</option>
         <option value="claude-sonnet-4-20250514">Sonnet 4</option>
@@ -761,6 +762,7 @@ const DASHBOARD_HTML = `<!DOCTYPE html>
       '<span style="color:#71767b;font-size:13px;margin-left:8px">Model:</span>' +
       '<select id="profile-model" class="model-select">' +
         '<option value="claude-sonnet-4-6">Sonnet 4.6</option>' +
+        '<option value="claude-opus-4-7">Opus 4.7</option>' +
         '<option value="claude-opus-4-6">Opus 4.6</option>' +
         '<option value="claude-haiku-4-5-20251001">Haiku 4.5</option>' +
       '</select>' +
